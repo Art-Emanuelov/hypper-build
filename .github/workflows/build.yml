@@ -1,4 +1,4 @@
-name: Build Hypper Test
+name: Build Hypper Frida APK
 
 on:
   workflow_dispatch:
@@ -16,6 +16,8 @@ jobs:
           mkdir -p assets
           gh release download v1 --repo ${{ github.repository }} --pattern "base.apk" --dir assets
           gh release download v1 --repo ${{ github.repository }} --pattern "split.apk" --dir assets
+          gh release download v1 --repo ${{ github.repository }} --pattern "libfrida-gadget.so" --dir assets
+          ls -la assets/
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -34,6 +36,7 @@ jobs:
           exec java -jar /usr/local/bin/apktool.jar "$@"
           EOF
           chmod +x /usr/local/bin/apktool
+          apktool --version
           yes | sudo sdkmanager --install "build-tools;34.0.0" > /dev/null 2>&1 || true
           sudo ln -sf "$ANDROID_HOME/build-tools/34.0.0/zipalign" /usr/local/bin/zipalign
           sudo ln -sf "$ANDROID_HOME/build-tools/34.0.0/apksigner" /usr/local/bin/apksigner
@@ -42,13 +45,60 @@ jobs:
         run: |
           apktool d -f -o decoded assets/base.apk
 
-      - name: Inject libs only
+      - name: Inject libs + renamed frida gadget
         run: |
           mkdir -p decoded/lib/arm64-v8a
           cd decoded/lib/arm64-v8a
           unzip -o -j ../../../assets/split.apk "lib/arm64-v8a/*"
           cd ../../..
-          ls -la decoded/lib/arm64-v8a/
+          cp assets/libfrida-gadget.so decoded/lib/arm64-v8a/libandroid_support.so
+          cat > decoded/lib/arm64-v8a/libandroid_support.config.so <<'EOF'
+          {
+            "interaction": {
+              "type": "listen",
+              "address": "127.0.0.1",
+              "port": 27042,
+              "on_load": "resume"
+            }
+          }
+          EOF
+
+      - name: Add DelayLoader smali class
+        run: |
+          mkdir -p decoded/smali/com/Hypper
+          cat > decoded/smali/com/Hypper/DelayLoader.smali <<'SMALI'
+          .class public Lcom/Hypper/DelayLoader;
+          .super Ljava/lang/Object;
+          .source "DelayLoader.java"
+
+          .implements Ljava/lang/Runnable;
+
+          .method public constructor <init>()V
+              .locals 0
+              invoke-direct {p0}, Ljava/lang/Object;-><init>()V
+              return-void
+          .end method
+
+          .method public run()V
+              .locals 4
+              const-wide/32 v0, 0x7530
+
+              :try_start
+              invoke-static {v0, v1}, Ljava/lang/Thread;->sleep(J)V
+              :try_end
+              .catch Ljava/lang/InterruptedException; {:try_start .. :try_end} :catch_end
+
+              goto :after_sleep
+
+              :catch_end
+              move-exception v2
+
+              :after_sleep
+              const-string v2, "android_support"
+              invoke-static {v2}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V
+              return-void
+          .end method
+          SMALI
 
       - name: Strip split attributes
         run: |
@@ -63,6 +113,61 @@ jobs:
           print("stripped")
           PY
 
+      - name: Patch launcher activity
+        run: |
+          python3 <<'PY'
+          import re, os, glob
+
+          manifest = open('decoded/AndroidManifest.xml').read()
+          target = None
+          for m in re.finditer(r'<activity\s+([^>]+?)>', manifest, re.DOTALL):
+              nm = re.search(r'android:name="([^"]+)"', m.group(1))
+              if not nm: continue
+              snippet = manifest[m.end():m.end()+1500]
+              if 'android.intent.action.MAIN' in snippet and 'android.intent.category.LAUNCHER' in snippet:
+                  target = nm.group(1); break
+          if not target:
+              for m in re.finditer(r'<activity\s+([^>]+?)>', manifest, re.DOTALL):
+                  nm = re.search(r'android:name="([^"]+)"', m.group(1))
+                  if nm and 'UnityPlayer' in nm.group(1):
+                      target = nm.group(1); break
+          if not target:
+              raise SystemExit("No launcher activity")
+
+          smali_path = target.replace('.', '/') + '.smali'
+          found = None
+          for d in sorted(glob.glob('decoded/smali*')):
+              c = os.path.join(d, smali_path)
+              if os.path.exists(c):
+                  found = c; break
+          if not found:
+              raise SystemExit("Smali not found")
+
+          content = open(found).read()
+          pattern = r'(\.method[^\n]*\bonCreate\b[^\n]*\n(?:[^\n]*\n)*?    \.locals\s+)(\d+)'
+          match = re.search(pattern, content)
+          if not match:
+              raise SystemExit("No onCreate")
+
+          old_n = int(match.group(2))
+          new_n = old_n + 2
+          reg_a = "v" + str(old_n)
+          reg_b = "v" + str(old_n + 1)
+
+          content = content[:match.start(2)] + str(new_n) + content[match.end(2):]
+          m2 = re.search(r'    \.locals\s+' + str(new_n) + r'\n', content)
+          inject = (
+              '    new-instance ' + reg_a + ', Lcom/Hypper/DelayLoader;\n'
+              '    invoke-direct {' + reg_a + '}, Lcom/Hypper/DelayLoader;-><init>()V\n'
+              '    new-instance ' + reg_b + ', Ljava/lang/Thread;\n'
+              '    invoke-direct {' + reg_b + ', ' + reg_a + '}, Ljava/lang/Thread;-><init>(Ljava/lang/Runnable;)V\n'
+              '    invoke-virtual {' + reg_b + '}, Ljava/lang/Thread;->start()V\n'
+          )
+          content = content[:m2.end()] + inject + content[m2.end():]
+          open(found, 'w').write(content)
+          print("patched")
+          PY
+
       - name: Build APK
         run: |
           apktool b decoded --use-aapt2 -o unsigned.apk
@@ -75,11 +180,11 @@ jobs:
             -dname "CN=H, OU=H, O=H, L=H, ST=H, C=US"
           zipalign -v -p 4 unsigned.apk aligned.apk || cp unsigned.apk aligned.apk
           apksigner sign --ks ks.jks --ks-pass pass:123456 --key-pass pass:123456 \
-            --out Hypper-Test.apk aligned.apk
+            --out Hypper-Frida.apk aligned.apk
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: Hypper-Test
-          path: Hypper-Test.apk
+          name: Hypper-Frida
+          path: Hypper-Frida.apk
           retention-days: 7
