@@ -30,7 +30,6 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y unzip zip
 
-          # Свежий apktool с поддержкой aapt2
           curl -L -o /usr/local/bin/apktool.jar \
             "https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar"
           cat > /usr/local/bin/apktool <<'EOF'
@@ -40,26 +39,32 @@ jobs:
           chmod +x /usr/local/bin/apktool
           apktool --version
 
-          # Android build-tools для zipalign и apksigner
           yes | sudo sdkmanager --install "build-tools;34.0.0" > /dev/null 2>&1 || true
           sudo ln -sf "$ANDROID_HOME/build-tools/34.0.0/zipalign" /usr/local/bin/zipalign
           sudo ln -sf "$ANDROID_HOME/build-tools/34.0.0/apksigner" /usr/local/bin/apksigner
           zipalign 2>&1 | head -1 || true
           apksigner --version || true
 
-      - name: Decode split.apk (основа с libs)
+      - name: Decode base.apk
         run: |
-          apktool d -f -o decoded assets/split.apk
-          ls decoded/ | head -20
+          apktool d -f -o decoded assets/base.apk
+          echo "=== decoded top ==="
+          ls decoded/
+          echo "=== manifest ==="
+          head -30 decoded/AndroidManifest.xml
 
-      - name: Inject frida-gadget + assets from base
+      - name: Inject libs from split + frida gadget
         run: |
+          # Копируем все .so из split.apk
           mkdir -p decoded/lib/arm64-v8a
+          cd decoded/lib/arm64-v8a
+          unzip -o -j ../../../assets/split.apk "lib/arm64-v8a/*"
+          cd ../../..
 
-          # Копируем frida gadget
+          # Добавляем frida gadget
           cp assets/libfrida-gadget.so decoded/lib/arm64-v8a/
 
-          # Конфиг gadget (порт 27042)
+          # Конфиг gadget
           cat > decoded/lib/arm64-v8a/libfrida-gadget.config.so <<'EOF'
           {
             "interaction": {
@@ -71,12 +76,35 @@ jobs:
           }
           EOF
 
-          # Копируем assets из base.apk (метадата Unity, ресурсы)
-          unzip -o assets/base.apk "assets/*" -d decoded/
-
+          echo "=== libs ready ==="
           ls -la decoded/lib/arm64-v8a/
-          echo "--- metadata check ---"
-          ls decoded/assets/bin/Data/Managed/Metadata/ 2>/dev/null || echo "metadata dir not found"
+
+      - name: Strip split attributes from manifest
+        run: |
+          python3 <<'PY'
+          import re
+          path = 'decoded/AndroidManifest.xml'
+          data = open(path).read()
+
+          # Убираем split-атрибуты, которые требуют наличия внешних сплитов
+          before = data
+          data = re.sub(r'\s+android:requiredSplitTypes="[^"]*"', '', data)
+          data = re.sub(r'\s+android:splitTypes="[^"]*"', '', data)
+          data = re.sub(r'\s+android:isSplitRequired="[^"]*"', '', data)
+
+          if data != before:
+              print("Split attrs stripped")
+          else:
+              print("No split attrs found (ok)")
+
+          open(path, 'w').write(data)
+          PY
+          
+          # Также чистим apktool.yml от split-инфы если она там есть
+          if [ -f decoded/apktool.yml ]; then
+            sed -i '/isSplitRequired/d' decoded/apktool.yml || true
+            sed -i '/requiredSplitTypes/d' decoded/apktool.yml || true
+          fi
 
       - name: Patch smali launcher activity
         run: |
@@ -85,20 +113,35 @@ jobs:
 
           manifest = open('decoded/AndroidManifest.xml').read()
 
+          # Ищем launcher activity (MAIN)
           target = None
-          for m in re.finditer(r'<activity\s+([^>]+)>', manifest):
+          for m in re.finditer(r'<activity\s+([^>]+?)>', manifest, re.DOTALL):
               attrs = m.group(1)
               name_match = re.search(r'android:name="([^"]+)"', attrs)
               if not name_match:
                   continue
               name = name_match.group(1)
-              snippet = manifest[m.end():m.end()+800]
-              if 'android.intent.action.MAIN' in snippet:
+              snippet = manifest[m.end():m.end()+1500]
+              if 'android.intent.action.MAIN' in snippet and 'android.intent.category.LAUNCHER' in snippet:
                   target = name
                   break
 
+          # Fallback: любая activity с MAIN
           if not target:
-              for m in re.finditer(r'<activity\s+([^>]+)>', manifest):
+              for m in re.finditer(r'<activity\s+([^>]+?)>', manifest, re.DOTALL):
+                  attrs = m.group(1)
+                  name_match = re.search(r'android:name="([^"]+)"', attrs)
+                  if not name_match:
+                      continue
+                  name = name_match.group(1)
+                  snippet = manifest[m.end():m.end()+1500]
+                  if 'android.intent.action.MAIN' in snippet:
+                      target = name
+                      break
+
+          # Fallback: UnityPlayer
+          if not target:
+              for m in re.finditer(r'<activity\s+([^>]+?)>', manifest, re.DOTALL):
                   name_match = re.search(r'android:name="([^"]+)"', m.group(1))
                   if name_match and 'UnityPlayer' in name_match.group(1):
                       target = name_match.group(1)
@@ -118,7 +161,18 @@ jobs:
                   break
 
           if not found_file:
-              raise SystemExit("ERROR: Smali not found for: " + smali_path)
+              # Рекурсивный поиск
+              base_name = os.path.basename(smali_path)
+              for smali_dir in sorted(glob.glob('decoded/smali*')):
+                  for root, dirs, files in os.walk(smali_dir):
+                      if base_name in files:
+                          found_file = os.path.join(root, base_name)
+                          break
+                  if found_file:
+                      break
+
+          if not found_file:
+              raise SystemExit("ERROR: Smali file not found")
 
           print("Found: " + found_file)
           content = open(found_file).read()
@@ -127,7 +181,7 @@ jobs:
           match = re.search(pattern, content)
 
           if not match:
-              raise SystemExit("ERROR: No onCreate with .locals")
+              raise SystemExit("ERROR: No onCreate with .locals in " + found_file)
 
           old_count = int(match.group(2))
           new_count = old_count + 1
