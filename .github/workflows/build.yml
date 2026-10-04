@@ -17,7 +17,6 @@ jobs:
           gh release download v1 --repo ${{ github.repository }} --pattern "base.apk" --dir assets
           gh release download v1 --repo ${{ github.repository }} --pattern "split.apk" --dir assets
           gh release download v1 --repo ${{ github.repository }} --pattern "libfrida-gadget.so" --dir assets
-          ls -la assets/
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -36,7 +35,6 @@ jobs:
           exec java -jar /usr/local/bin/apktool.jar "$@"
           EOF
           chmod +x /usr/local/bin/apktool
-          apktool --version
           yes | sudo sdkmanager --install "build-tools;34.0.0" > /dev/null 2>&1 || true
           sudo ln -sf "$ANDROID_HOME/build-tools/34.0.0/zipalign" /usr/local/bin/zipalign
           sudo ln -sf "$ANDROID_HOME/build-tools/34.0.0/apksigner" /usr/local/bin/apksigner
@@ -45,14 +43,15 @@ jobs:
         run: |
           apktool d -f -o decoded assets/base.apk
 
-      - name: Inject libs + frida gadget
+      - name: Inject libs + renamed frida gadget
         run: |
           mkdir -p decoded/lib/arm64-v8a
           cd decoded/lib/arm64-v8a
           unzip -o -j ../../../assets/split.apk "lib/arm64-v8a/*"
           cd ../../..
-          cp assets/libfrida-gadget.so decoded/lib/arm64-v8a/
-          cat > decoded/lib/arm64-v8a/libfrida-gadget.config.so <<'EOF'
+          # Переименовываем gadget, чтобы PGL не палил по имени файла
+          cp assets/libfrida-gadget.so decoded/lib/arm64-v8a/libandroid_support.so
+          cat > decoded/lib/arm64-v8a/libandroid_support.config.so <<'EOF'
           {
             "interaction": {
               "type": "listen",
@@ -94,7 +93,7 @@ jobs:
               move-exception v2
 
               :after_sleep
-              const-string v2, "frida-gadget"
+              const-string v2, "android_support"
               invoke-static {v2}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V
               return-void
           .end method
@@ -106,12 +105,11 @@ jobs:
           import re
           path = 'decoded/AndroidManifest.xml'
           data = open(path).read()
-          before = data
           data = re.sub(r'\s+android:requiredSplitTypes="[^"]*"', '', data)
           data = re.sub(r'\s+android:splitTypes="[^"]*"', '', data)
           data = re.sub(r'\s+android:isSplitRequired="[^"]*"', '', data)
-          print("stripped" if data != before else "no split attrs")
           open(path, 'w').write(data)
+          print("stripped")
           PY
 
       - name: Patch launcher activity
@@ -122,8 +120,7 @@ jobs:
           manifest = open('decoded/AndroidManifest.xml').read()
           target = None
           for m in re.finditer(r'<activity\s+([^>]+?)>', manifest, re.DOTALL):
-              attrs = m.group(1)
-              nm = re.search(r'android:name="([^"]+)"', attrs)
+              nm = re.search(r'android:name="([^"]+)"', m.group(1))
               if not nm: continue
               snippet = manifest[m.end():m.end()+1500]
               if 'android.intent.action.MAIN' in snippet and 'android.intent.category.LAUNCHER' in snippet:
@@ -134,9 +131,8 @@ jobs:
                   if nm and 'UnityPlayer' in nm.group(1):
                       target = nm.group(1); break
           if not target:
-              raise SystemExit("No launcher activity found")
+              raise SystemExit("No launcher activity")
 
-          print("Target: " + target)
           smali_path = target.replace('.', '/') + '.smali'
           found = None
           for d in sorted(glob.glob('decoded/smali*')):
@@ -144,20 +140,18 @@ jobs:
               if os.path.exists(c):
                   found = c; break
           if not found:
-              raise SystemExit("Smali not found: " + smali_path)
+              raise SystemExit("Smali not found")
 
-          print("Found: " + found)
           content = open(found).read()
           pattern = r'(\.method[^\n]*\bonCreate\b[^\n]*\n(?:[^\n]*\n)*?    \.locals\s+)(\d+)'
           match = re.search(pattern, content)
           if not match:
-              raise SystemExit("No onCreate with .locals")
+              raise SystemExit("No onCreate")
 
           old_n = int(match.group(2))
           new_n = old_n + 2
           reg_a = "v" + str(old_n)
           reg_b = "v" + str(old_n + 1)
-          print("locals: " + str(old_n) + " -> " + str(new_n))
 
           content = content[:match.start(2)] + str(new_n) + content[match.end(2):]
           m2 = re.search(r'    \.locals\s+' + str(new_n) + r'\n', content)
@@ -170,7 +164,7 @@ jobs:
           )
           content = content[:m2.end()] + inject + content[m2.end():]
           open(found, 'w').write(content)
-          print("SUCCESS")
+          print("patched")
           PY
 
       - name: Build APK
