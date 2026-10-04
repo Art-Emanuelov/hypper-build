@@ -1,0 +1,124 @@
+name: Build Hypper Frida APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p assets
+          gh release download v1 --repo ${{ github.repository }} --pattern "base.apk" --dir assets
+          gh release download v1 --repo ${{ github.repository }} --pattern "split.apk" --dir assets
+          gh release download v1 --repo ${{ github.repository }} --pattern "libfrida-gadget.so" --dir assets
+          ls -la assets/
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y apktool zipalign
+          apktool --version
+
+      - name: Decode base.apk
+        run: |
+          apktool d -f -o decoded assets/base.apk
+
+      - name: Inject libs from split
+        run: |
+          mkdir -p decoded/lib/arm64-v8a
+          cd decoded/lib/arm64-v8a
+          unzip -o -j ../../../assets/split.apk "lib/arm64-v8a/*"
+          cd ../../..
+          cp assets/libfrida-gadget.so decoded/lib/arm64-v8a/
+          cat > decoded/lib/arm64-v8a/libfrida-gadget.config.so <<'EOF'
+          {
+            "interaction": {
+              "type": "listen",
+              "address": "127.0.0.1",
+              "port": 27042,
+              "on_load": "resume"
+            }
+          }
+          EOF
+          ls -la decoded/lib/arm64-v8a/
+
+      - name: Patch smali Application
+        run: |
+          python3 <<'PY'
+          import os, re, glob
+          manifest = open('decoded/AndroidManifest.xml').read()
+          m = re.search(r'<application[^>]*android:name="([^"]+)"', manifest)
+          if m:
+              app_class = m.group(1)
+          else:
+              app_class = 'com.unity3d.player.UnityPlayerActivity'
+              print('No Application class - fallback to UnityPlayerActivity')
+          print('Target:', app_class)
+          smali_path = app_class.replace('.', '/') + '.smali'
+          found = False
+          for smali_dir in glob.glob('decoded/smali*'):
+              candidate = os.path.join(smali_dir, smali_path)
+              if os.path.exists(candidate):
+                  print('Found:', candidate)
+                  content = open(candidate).read()
+                  target = 'invoke-super {p0}, Landroid/app/Application;->onCreate()V'
+                  if target not in content:
+                      target = 'invoke-super {p0}, Lcom/unity3d/player/UnityPlayerActivity;->onCreate()V'
+                  if target in content:
+                      injection = 'const-string v0, "frida-gadget"\n    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n    '
+                      content = content.replace(target, injection + target, 1)
+                      open(candidate, 'w').write(content)
+                      print('Patched!')
+                      found = True
+                      break
+          if not found:
+              print('Could not find Application smali, trying UnityPlayerActivity...')
+              for smali_dir in glob.glob('decoded/smali*'):
+                  for path in glob.glob(smali_dir + '/com/unity3d/player/*.smali'):
+                      if 'UnityPlayerActivity' in path:
+                          content = open(path).read()
+                          target = 'invoke-super {p0}, Lcom/unity3d/player/UnityPlayerActivity;->onCreate()V'
+                          if target in content:
+                              injection = 'const-string v0, "frida-gadget"\n    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n    '
+                              content = content.replace(target, injection + target, 1)
+                              open(path, 'w').write(content)
+                              print('Patched UnityPlayerActivity:', path)
+                              found = True
+                              break
+          if not found:
+              raise SystemExit('FAILED: could not patch smali')
+          PY
+
+      - name: Build APK
+        run: |
+          apktool b decoded -o unsigned.apk
+          ls -la unsigned.apk
+
+      - name: Sign APK
+        run: |
+          keytool -genkey -v -keystore ks.jks -keyalg RSA -keysize 2048 -validity 10000 \
+            -alias key -storepass 123456 -keypass 123456 \
+            -dname "CN=H, OU=H, O=H, L=H, ST=H, C=US"
+          zipalign -v -p 4 unsigned.apk aligned.apk || cp unsigned.apk aligned.apk
+          apksigner sign --ks ks.jks --ks-pass pass:123456 --key-pass pass:123456 \
+            --out Hypper-Frida.apk aligned.apk
+          ls -la Hypper-Frida.apk
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hypper-Frida
+          path: Hypper-Frida.apk
+          retention-days: 7
