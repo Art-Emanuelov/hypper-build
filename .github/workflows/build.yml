@@ -57,48 +57,71 @@ jobs:
       - name: Patch smali Application
         run: |
           python3 <<'PY'
-          import os, re, glob
+          import re, os, glob
+          
           manifest = open('decoded/AndroidManifest.xml').read()
-          m = re.search(r'<application[^>]*android:name="([^"]+)"', manifest)
-          if m:
-              app_class = m.group(1)
-          else:
-              app_class = 'com.unity3d.player.UnityPlayerActivity'
-              print('No Application class - fallback to UnityPlayerActivity')
-          print('Target:', app_class)
-          smali_path = app_class.replace('.', '/') + '.smali'
-          found = False
-          for smali_dir in glob.glob('decoded/smali*'):
+          
+          target = None
+          for m in re.finditer(r'<activity\s+([^>]+)>', manifest):
+              attrs = m.group(1)
+              name_match = re.search(r'android:name="([^"]+)"', attrs)
+              if not name_match:
+                  continue
+              name = name_match.group(1)
+              snippet = manifest[m.end():m.end()+600]
+              if 'android.intent.action.MAIN' in snippet:
+                  target = name
+                  break
+              if target is None and 'UnityPlayer' in name:
+                  target = name
+          
+          if not target:
+              raise SystemExit("No launcher activity found")
+          
+          print("Target activity: " + target)
+          smali_path = target.replace('.', '/') + '.smali'
+          
+          found_file = None
+          for smali_dir in sorted(glob.glob('decoded/smali*')):
               candidate = os.path.join(smali_dir, smali_path)
               if os.path.exists(candidate):
-                  print('Found:', candidate)
-                  content = open(candidate).read()
-                  target = 'invoke-super {p0}, Landroid/app/Application;->onCreate()V'
-                  if target not in content:
-                      target = 'invoke-super {p0}, Lcom/unity3d/player/UnityPlayerActivity;->onCreate()V'
-                  if target in content:
-                      injection = 'const-string v0, "frida-gadget"\n    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n    '
-                      content = content.replace(target, injection + target, 1)
-                      open(candidate, 'w').write(content)
-                      print('Patched!')
-                      found = True
-                      break
-          if not found:
-              print('Could not find Application smali, trying UnityPlayerActivity...')
-              for smali_dir in glob.glob('decoded/smali*'):
-                  for path in glob.glob(smali_dir + '/com/unity3d/player/*.smali'):
-                      if 'UnityPlayerActivity' in path:
-                          content = open(path).read()
-                          target = 'invoke-super {p0}, Lcom/unity3d/player/UnityPlayerActivity;->onCreate()V'
-                          if target in content:
-                              injection = 'const-string v0, "frida-gadget"\n    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n    '
-                              content = content.replace(target, injection + target, 1)
-                              open(path, 'w').write(content)
-                              print('Patched UnityPlayerActivity:', path)
-                              found = True
-                              break
-          if not found:
-              raise SystemExit('FAILED: could not patch smali')
+                  found_file = candidate
+                  break
+          
+          if not found_file:
+              raise SystemExit("Smali not found: " + smali_path)
+          
+          print("Found: " + found_file)
+          content = open(found_file).read()
+          
+          pattern = r'(\.method[^\n]*\bonCreate\b[^\n]*\n(?:[^\n]*\n)*?    \.locals\s+)(\d+)'
+          match = re.search(pattern, content)
+          
+          if not match:
+              raise SystemExit("No onCreate with .locals found")
+          
+          old_count = int(match.group(2))
+          new_count = old_count + 1
+          reg = "v" + str(old_count)
+          print("locals: " + str(old_count) + " -> " + str(new_count) + ", using register " + reg)
+          
+          new_content = content[:match.start(2)] + str(new_count) + content[match.end(2):]
+          
+          m2 = re.search(r'    \.locals\s+' + str(new_count) + r'\n', new_content)
+          inject = (
+              '    const-string ' + reg + ', "frida-gadget"\n'
+              '    invoke-static {' + reg + '}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n'
+          )
+          new_content = new_content[:m2.end()] + inject + new_content[m2.end():]
+          
+          open(found_file, 'w').write(new_content)
+          print("SUCCESS: patched " + found_file)
+          
+          verify = open(found_file).read()
+          if 'frida-gadget' in verify:
+              print("VERIFIED")
+          else:
+              raise SystemExit("Verify failed")
           PY
 
       - name: Build APK
