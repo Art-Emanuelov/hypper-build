@@ -29,8 +29,8 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y unzip zip
-          
-          # --- Установка свежего apktool ---
+
+          # Свежий apktool с поддержкой aapt2
           curl -L -o /usr/local/bin/apktool.jar \
             "https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar"
           cat > /usr/local/bin/apktool <<'EOF'
@@ -39,33 +39,27 @@ jobs:
           EOF
           chmod +x /usr/local/bin/apktool
           apktool --version
-          
-          # --- Установка Android build-tools для zipalign и apksigner ---
+
+          # Android build-tools для zipalign и apksigner
           yes | sudo sdkmanager --install "build-tools;34.0.0" > /dev/null 2>&1 || true
-          # Добавляем пути к утилитам в PATH
-          echo "$ANDROID_HOME/build-tools/34.0.0" >> "$GITHUB_PATH"
-          # Создаём симлинки для удобства
           sudo ln -sf "$ANDROID_HOME/build-tools/34.0.0/zipalign" /usr/local/bin/zipalign
           sudo ln -sf "$ANDROID_HOME/build-tools/34.0.0/apksigner" /usr/local/bin/apksigner
-          
-          # Проверка
           zipalign 2>&1 | head -1 || true
           apksigner --version || true
 
-      - name: Decode base.apk
+      - name: Decode split.apk (основа с libs)
         run: |
-          apktool d -f -o decoded assets/base.apk
+          apktool d -f -o decoded assets/split.apk
           ls decoded/ | head -20
 
-      - name: Inject libs from split
+      - name: Inject frida-gadget + assets from base
         run: |
           mkdir -p decoded/lib/arm64-v8a
-          cd decoded/lib/arm64-v8a
-          unzip -o -j ../../../assets/split.apk "lib/arm64-v8a/*"
-          cd ../../..
-          # Копируем Gadget
+
+          # Копируем frida gadget
           cp assets/libfrida-gadget.so decoded/lib/arm64-v8a/
-          # Создаём конфиг для Gadget (поднимает сервер на порту 27042)
+
+          # Конфиг gadget (порт 27042)
           cat > decoded/lib/arm64-v8a/libfrida-gadget.config.so <<'EOF'
           {
             "interaction": {
@@ -76,17 +70,21 @@ jobs:
             }
           }
           EOF
-          ls -la decoded/lib/arm64-v8a/
 
-      - name: Patch smali Application (universal)
+          # Копируем assets из base.apk (метадата Unity, ресурсы)
+          unzip -o assets/base.apk "assets/*" -d decoded/
+
+          ls -la decoded/lib/arm64-v8a/
+          echo "--- metadata check ---"
+          ls decoded/assets/bin/Data/Managed/Metadata/ 2>/dev/null || echo "metadata dir not found"
+
+      - name: Patch smali launcher activity
         run: |
           python3 <<'PY'
           import re, os, glob
-          
-          print("=== Step 1: Parse AndroidManifest.xml ===")
+
           manifest = open('decoded/AndroidManifest.xml').read()
-          
-          # Ищем главную активность с MAIN intent-filter
+
           target = None
           for m in re.finditer(r'<activity\s+([^>]+)>', manifest):
               attrs = m.group(1)
@@ -98,103 +96,76 @@ jobs:
               if 'android.intent.action.MAIN' in snippet:
                   target = name
                   break
-          
+
           if not target:
-              # Fallback: ищем любой UnityPlayer
               for m in re.finditer(r'<activity\s+([^>]+)>', manifest):
                   name_match = re.search(r'android:name="([^"]+)"', m.group(1))
                   if name_match and 'UnityPlayer' in name_match.group(1):
                       target = name_match.group(1)
                       break
-          
+
           if not target:
-              raise SystemExit("ERROR: No launcher activity found in AndroidManifest.xml")
-          
+              raise SystemExit("ERROR: No launcher activity found")
+
           print("Target activity: " + target)
           smali_path = target.replace('.', '/') + '.smali'
-          print("Looking for smali: " + smali_path)
-          
-          # === Step 2: Find the smali file ===
+
           found_file = None
           for smali_dir in sorted(glob.glob('decoded/smali*')):
               candidate = os.path.join(smali_dir, smali_path)
               if os.path.exists(candidate):
                   found_file = candidate
                   break
-          
+
           if not found_file:
-              # Last resort: search by filename anywhere
-              for smali_dir in sorted(glob.glob('decoded/smali*')):
-                  for root, dirs, files in os.walk(smali_dir):
-                      fname = os.path.basename(smali_path)
-                      if fname in files:
-                          found_file = os.path.join(root, fname)
-                          break
-                  if found_file:
-                      break
-          
-          if not found_file:
-              raise SystemExit("ERROR: Smali file not found for: " + smali_path)
-          
+              raise SystemExit("ERROR: Smali not found for: " + smali_path)
+
           print("Found: " + found_file)
-          
-          # === Step 3: Read and patch ===
           content = open(found_file).read()
-          
-          # Ищем метод onCreate и объявление .locals
+
           pattern = r'(\.method[^\n]*\bonCreate\b[^\n]*\n(?:[^\n]*\n)*?    \.locals\s+)(\d+)'
           match = re.search(pattern, content)
-          
+
           if not match:
-              raise SystemExit("ERROR: No onCreate method with .locals found in " + found_file)
-          
+              raise SystemExit("ERROR: No onCreate with .locals")
+
           old_count = int(match.group(2))
           new_count = old_count + 1
           reg = "v" + str(old_count)
-          print("Locals: " + str(old_count) + " -> " + str(new_count) + ", using register " + reg)
-          
-          # Заменяем .locals N на .locals N+1
+          print("Locals: " + str(old_count) + " -> " + str(new_count))
+
           new_content = content[:match.start(2)] + str(new_count) + content[match.end(2):]
-          
-          # Находим новую строку .locals и вставляем код ПОСЛЕ неё
           m2 = re.search(r'    \.locals\s+' + str(new_count) + r'\n', new_content)
+
           inject = (
               '    const-string ' + reg + ', "frida-gadget"\n'
               '    invoke-static {' + reg + '}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n'
           )
           new_content = new_content[:m2.end()] + inject + new_content[m2.end():]
-          
-          # Сохраняем
+
           open(found_file, 'w').write(new_content)
-          print("SUCCESS: Patched " + found_file)
-          
-          # Verify
+
           verify = open(found_file).read()
           if 'frida-gadget' in verify:
-              print("VERIFIED: frida-gadget found in patched file")
+              print("VERIFIED: patch applied")
           else:
-              raise SystemExit("ERROR: Verification failed - frida-gadget not found after patch")
+              raise SystemExit("ERROR: Verification failed")
           PY
 
-      - name: Build APK (with aapt2)
+      - name: Build APK
         run: |
           apktool b decoded --use-aapt2 -o unsigned.apk
           ls -la unsigned.apk
 
       - name: Sign APK
         run: |
-          # Генерация ключа
           keytool -genkey -v -keystore ks.jks -keyalg RSA -keysize 2048 -validity 10000 \
             -alias key -storepass 123456 -keypass 123456 \
             -dname "CN=H, OU=H, O=H, L=H, ST=H, C=US"
-          
-          # Выравнивание
+
           zipalign -v -p 4 unsigned.apk aligned.apk || cp unsigned.apk aligned.apk
-          
-          # Подпись
           apksigner sign --ks ks.jks --ks-pass pass:123456 --key-pass pass:123456 \
             --out Hypper-Frida.apk aligned.apk
-          
           ls -la Hypper-Frida.apk
 
       - name: Upload artifact
