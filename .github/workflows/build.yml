@@ -41,18 +41,62 @@ jobs:
           sudo ln -sf "$ANDROID_HOME/build-tools/34.0.0/zipalign" /usr/local/bin/zipalign
           sudo ln -sf "$ANDROID_HOME/build-tools/34.0.0/apksigner" /usr/local/bin/apksigner
 
+      - name: Patch frida-gadget signatures
+        run: |
+          python3 <<'PY'
+          import re
+
+          data = open('assets/libfrida-gadget.so', 'rb').read()
+          original_size = len(data)
+          print(f"Original size: {original_size}")
+
+          # Замены ТОЛЬКО той же длины, чтобы не сломать оффсеты
+          replacements = [
+              (b'LIBFRIDA', b'LIBSYSAA'),
+              (b'libfrida', b'libsysaa'),
+              (b'frida', b'sysaa'),
+              (b'Frida', b'Sysaa'),
+              (b'FRIDA', b'SYSAA'),
+              (b'gum-js-loop', b'sys-js-loop'),
+              (b'gum-js-thread', b'sys-js-thread'),
+              (b'gum-js', b'sys-js'),
+              (b'frida_agent', b'sysaa_agent'),
+              (b'frida-gadget', b'sysaa-gadget'),
+              (b'frida_gadget', b'sysaa_gadget'),
+              (b'frida-server', b'sysaa-server'),
+              (b'frida-helper', b'sysaa-helper'),
+              (b'gadget', b'sysaad'),
+              (b'Gadget', b'Sysaad'),
+              (b'GADGET', b'SYSAAD'),
+          ]
+
+          for old, new in replacements:
+              if len(old) != len(new):
+                  print(f"SKIP (length mismatch): {old} -> {new}")
+                  continue
+              count = data.count(old)
+              if count > 0:
+                  data = data.replace(old, new)
+                  print(f"Replaced {count}x: {old.decode()} -> {new.decode()}")
+
+          assert len(data) == original_size, "Size changed! Abort."
+
+          open('assets/libfrida-gadget.so', 'wb').write(data)
+          print(f"Patched, size still {len(data)}")
+          PY
+
       - name: Decode base.apk
         run: |
           apktool d -f -o decoded assets/base.apk
 
-      - name: Inject libs + renamed frida gadget
+      - name: Inject libs + patched gadget
         run: |
           mkdir -p decoded/lib/arm64-v8a
           cd decoded/lib/arm64-v8a
           unzip -o -j ../../../assets/split.apk "lib/arm64-v8a/*"
           cd ../../..
-          cp assets/libfrida-gadget.so decoded/lib/arm64-v8a/libandroid_support.so
-          cat > decoded/lib/arm64-v8a/libandroid_support.config.so <<'EOF'
+          cp assets/libfrida-gadget.so decoded/lib/arm64-v8a/libsqlite3.so
+          cat > decoded/lib/arm64-v8a/libsqlite3.config.so <<'EOF'
           {
             "interaction": {
               "type": "listen",
@@ -81,7 +125,7 @@ jobs:
 
           .method public run()V
               .locals 4
-              const-wide/32 v0, 0x7530
+              const-wide/32 v0, 0x4e20
 
               :try_start
               invoke-static {v0, v1}, Ljava/lang/Thread;->sleep(J)V
@@ -94,7 +138,7 @@ jobs:
               move-exception v2
 
               :after_sleep
-              const-string v2, "android_support"
+              const-string v2, "sqlite3"
               invoke-static {v2}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V
               return-void
           .end method
